@@ -52,30 +52,21 @@ def _conv_transpose(
     dilation=1,
 ):
     dims = len(input.shape) - 2
-    weight = ivy.permute_dims(weight, axes=(*range(2, dims + 2), 0, 1))
-    for i in range(dims):
-        weight = ivy.flip(weight, axis=i)
     padding, output_padding = map(
-        lambda x: [x] * dims if isinstance(x, int) else x, [padding, output_padding]
+        lambda x: [x] * dims if isinstance(x, int) else list(x), [padding, output_padding]
     )
-    pad_widths = [(weight.shape[i] - 1,) * 2 for i in range(dims)]
-    ret = ivy.conv_general_dilated(
+    ret = ivy.conv_general_transpose(
         input,
         weight,
-        1,
-        pad_widths,
+        stride,
+        padding,
+        output_padding=output_padding,
         dims=dims,
         data_format="channel_first",
         feature_group_count=groups,
-        x_dilations=stride,
+        dilations=dilation,
         bias=bias,
     )
-    unpad_slice = (slice(None),) * 2
-    for i in range(dims):
-        unpad_slice += (
-            slice(padding[i], ret.shape[2 + i] - padding[i] + output_padding[i], 1),
-        )
-    ret = ret[unpad_slice]
     return ret
 
 

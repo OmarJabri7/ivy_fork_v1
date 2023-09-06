@@ -82,6 +82,30 @@ def _output_shape(
     return output_shape
 
 
+def deconv_output_length(input_len, filter_size, padding, output_padding=None, stride=0, dilation=1):
+    filter_size = filter_size + (filter_size - 1) * (dilation - 1)
+
+    if isinstance(padding, str):
+        padding = padding.lower()
+        if output_padding is None:
+            if padding == 'valid':
+                length = input_len * stride + max(filter_size - stride, 0)
+            elif padding == 'full':
+                length = input_len * stride - (stride + filter_size - 2)
+            elif padding == 'same':
+                length = input_len * stride
+        else:
+            if padding == 'same':
+                pad = filter_size // 2
+            elif padding == 'valid':
+                pad = 0
+            elif padding == 'full':
+                pad = filter_size - 1
+            length = ((input_len - 1) * stride + filter_size - 2 * pad + output_padding)
+    else:
+        length = (input_len - 1) * stride - 2 * padding + dilation * (filter_size - 1) + output_padding + 1
+    return length
+
 @with_unsupported_dtypes({"2.13.0 and below": ("bfloat16", "complex")}, backend_version)
 def conv1d(
     x: Union[tf.Tensor, tf.Variable],
@@ -175,34 +199,65 @@ def conv2d_transpose(
     x: Union[tf.Tensor, tf.Variable],
     filters: Union[tf.Tensor, tf.Variable],
     strides: Union[int, Tuple[int, int]],
-    padding: str,
+    padding: Union[str, int, Sequence[Tuple[int, int]]],
     /,
     *,
+    output_padding: Union[int,  Sequence[Tuple[int, int]]] = 0,
     output_shape: Optional[Union[ivy.NativeShape, Sequence[int]]] = None,
     data_format: str = "NHWC",
     dilations: Union[int, Tuple[int, int]] = 1,
     bias: Optional[Union[tf.Tensor, tf.Variable]] = None,
     out: Optional[Union[tf.Tensor, tf.Variable]] = None,
 ):
-    if ivy.dev(x) == "cpu" and (
-        (dilations > 1) if isinstance(dilations, int) else any(d > 1 for d in dilations)
-    ):
-        raise ivy.utils.exceptions.IvyException(
-            "Tensorflow does not support dilations greater than 1 when device is cpu"
-        )
-    if data_format == "NCHW":
+    if ivy.dev(x) == "cpu":
+        if (dilations > 1) if isinstance(dilations, int) else any(d > 1 for d in dilations):
+            raise ivy.utils.exceptions.IvyException(
+                "Tensorflow does not support dilations greater than 1 when device is cpu"
+            )
         x = tf.transpose(x, (0, 2, 3, 1))
-    filters = tf.transpose(filters, (0, 1, 3, 2))
-    output_shape = _output_shape(
-        x.shape, filters.shape, output_shape, strides, padding, 2, dilations
-    )
-    res = tf.nn.conv2d_transpose(
-        x, filters, output_shape, strides, padding, "NHWC", dilations
-    )
-    res = tf.math.add(res, bias) if bias is not None else res
-    if data_format == "NCHW":
-        return tf.transpose(res, (0, 3, 1, 2))
-    return res
+        filters = tf.transpose(filters, (2, 3, 1, 0))
+        if data_format == "NCHW":
+            height = x.shape[2]
+            width = x.shape[3]
+        else:
+            height = x.shape[1]
+            width = x.shape[2]
+        kernel_h = filters.shape[0]
+        kernel_w = filters.shape[1]
+        if output_padding:
+            out_pad_h, out_pad_w = output_padding[0], output_padding[1]
+        else:
+            out_pad_h, out_pad_w = None, None
+        strides = [strides for _ in range(2)]
+        dilations = [dilations for _ in range(2)]
+        out_height = deconv_output_length(height,
+                                        kernel_h,
+                                        padding=padding[0],
+                                        output_padding=out_pad_h,
+                                        stride=strides[0],
+                                        dilation=dilations[0])
+        out_width = deconv_output_length(width,
+                                        kernel_w,
+                                        padding=padding[1],
+                                        output_padding=out_pad_w,
+                                        stride=strides[1],
+                                        dilation=dilations[1])
+        if data_format == 'NCHW':
+            output_shape = (x.shape[0], filters.shape[-2], out_height, out_width)
+        else:
+            output_shape = (x.shape[0], out_height, out_width, filters.shape[-2])
+        padding = [(pad, pad) if isinstance(pad, int) else pad for pad in padding]
+        if isinstance(padding, list):
+            if data_format == "NHWC":
+                padding = [(0,0)] + padding + [(0,0)]
+            else:
+                padding.insert(0, (0,0))
+                padding.insert(0, (0,0))
+        res = tf.nn.conv2d_transpose(x, filters, output_shape, strides, padding, "NHWC", dilations)
+        res = tf.math.add(res, bias) if bias is not None else res
+        if data_format == "NCHW":
+            return tf.transpose(res, (0, 3, 1, 2))
+        return res
 
 
 @with_unsupported_dtypes({"2.13.0 and below": ("bfloat16", "complex")}, backend_version)
@@ -420,9 +475,10 @@ def conv_general_transpose(
     x: Union[tf.Tensor, tf.Variable],
     filters: Union[tf.Tensor, tf.Variable],
     strides: Union[int, Tuple[int, int]],
-    padding: str,
+    padding: Union[str, int, Sequence[Tuple[int, int]]],
     /,
     *,
+    output_padding: Union[int, Sequence[Tuple[int, int]]] = 0,
     dims: int = 2,
     data_format: str = "channel_last",
     output_shape: Optional[Union[ivy.NativeShape, Sequence[int]]] = None,
@@ -431,8 +487,6 @@ def conv_general_transpose(
     bias: Optional[Union[tf.Tensor, tf.Variable]] = None,
     out: Optional[Union[tf.Tensor, tf.Variable]] = None,
 ) -> Union[tf.Tensor, tf.Variable]:
-    if data_format == "channel_first":
-        x = tf.transpose(x, (0, *range(2, dims + 2), 1))
     if dims == 1:
         res = tf.concat(
             [
@@ -455,16 +509,17 @@ def conv_general_transpose(
         res = tf.concat(
             [
                 conv2d_transpose(
-                    x[..., j : j + filters.shape[-2] // feature_group_count],
-                    filters[..., j : j + filters.shape[-2] // feature_group_count, :],
+                    x[..., j : j + filters.shape[1] // feature_group_count],
+                    filters[..., j : j + filters.shape[1] // feature_group_count, :],
                     strides,
                     padding,
+                    output_padding=output_padding,
                     output_shape=output_shape,
                     data_format="NHWC",
                     dilations=dilations,
                 )
                 for j in range(
-                    0, filters.shape[-2], filters.shape[-2] // feature_group_count
+                    0, filters.shape[1], filters.shape[1] // feature_group_count
                 )
             ],
             axis=-1,
